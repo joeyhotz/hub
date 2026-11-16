@@ -20,7 +20,37 @@ const SlackThreadMessageSchema = z
     user: z.string().min(1).max(255).optional(),
     bot_id: z.string().min(1).max(255).optional(),
     files: z.array(SlackFileSchema).optional(),
+    // Apps such as Sentry put the substance of a post in blocks or legacy attachments
+    // and leave `text` as a one-line fallback. Each entry is parsed on its own, so one
+    // unexpected shape drops only that entry, never the thread.
+    blocks: z.array(z.unknown()).optional().catch(undefined),
+    attachments: z.array(z.unknown()).optional().catch(undefined),
   })
+  .passthrough();
+const SlackTextObjectSchema = z.object({ text: z.string() }).passthrough();
+const SlackBlockSchema = z
+  .object({
+    type: z.string(),
+    text: SlackTextObjectSchema.optional().catch(undefined),
+    fields: z.array(z.unknown()).optional().catch(undefined),
+    elements: z.array(z.unknown()).optional().catch(undefined),
+  })
+  .passthrough();
+const SlackLegacyAttachmentSchema = z
+  .object({
+    fallback: z.string().optional().catch(undefined),
+    pretext: z.string().optional().catch(undefined),
+    author_name: z.string().optional().catch(undefined),
+    title: z.string().optional().catch(undefined),
+    title_link: z.string().optional().catch(undefined),
+    text: z.string().optional().catch(undefined),
+    fields: z.array(z.unknown()).optional().catch(undefined),
+    footer: z.string().optional().catch(undefined),
+    blocks: z.array(z.unknown()).optional().catch(undefined),
+  })
+  .passthrough();
+const SlackAttachmentFieldSchema = z
+  .object({ title: z.string().optional(), value: z.string().optional() })
   .passthrough();
 const SlackThreadRepliesSchema = SlackApiResponseSchema.extend({
   messages: z.array(SlackThreadMessageSchema).optional(),
@@ -362,7 +392,7 @@ function normalizeThreadMessage(
   return {
     ts: message.ts,
     createdAt: new Date(Number(message.ts) * 1_000).toISOString(),
-    content: message.text,
+    content: slackMessageContent(message),
     author: { id: message.user ?? message.bot_id ?? "unknown" },
     attachments: (message.files ?? []).map((file) => ({
       id: file.id,
@@ -371,6 +401,69 @@ function normalizeThreadMessage(
       size: file.size ?? null,
     })),
   };
+}
+
+// `text` plus the readable text of section, header and context blocks and of legacy
+// attachments. rich_text blocks are skipped: they mirror `text` for typed messages.
+function slackMessageContent(message: z.infer<typeof SlackThreadMessageSchema>): string {
+  const lines = [
+    ...slackBlockLines(message.blocks),
+    ...(message.attachments ?? []).flatMap(slackAttachmentLines),
+  ];
+  const seen = new Set([message.text.trim()]);
+  const extra = lines
+    .map((line) => line.trim())
+    .filter((line) => {
+      if (line.length === 0 || seen.has(line)) return false;
+      seen.add(line);
+      return true;
+    });
+  return [message.text, ...extra].filter((line) => line.length > 0).join("\n");
+}
+
+function slackBlockLines(blocks: unknown[] | undefined): string[] {
+  return (blocks ?? []).flatMap((value) => {
+    const block = SlackBlockSchema.safeParse(value);
+    if (!block.success) return [];
+    const { type, text, fields, elements } = block.data;
+    if (type === "section") return [text?.text, ...slackTextObjects(fields)].filter(isString);
+    if (type === "header") return text === undefined ? [] : [text.text];
+    if (type === "context") return [slackTextObjects(elements).join(" ")];
+    return [];
+  });
+}
+
+function slackAttachmentLines(value: unknown): string[] {
+  const attachment = SlackLegacyAttachmentSchema.safeParse(value);
+  if (!attachment.success) return [];
+  const { fallback, pretext, author_name, title, title_link, text, fields, footer, blocks } =
+    attachment.data;
+  const lines = [
+    pretext,
+    author_name,
+    title !== undefined && title_link !== undefined ? `${title} (${title_link})` : title,
+    text,
+    ...(fields ?? []).flatMap((field) => {
+      const parsed = SlackAttachmentFieldSchema.safeParse(field);
+      if (!parsed.success) return [];
+      const { title: label, value: fieldValue } = parsed.data;
+      return [[label, fieldValue].filter(isString).join(": ")];
+    }),
+    ...slackBlockLines(blocks),
+    footer,
+  ].filter(isString);
+  return lines.length > 0 || fallback === undefined ? lines : [fallback];
+}
+
+function slackTextObjects(values: unknown[] | undefined): string[] {
+  return (values ?? []).flatMap((value) => {
+    const parsed = SlackTextObjectSchema.safeParse(value);
+    return parsed.success ? [parsed.data.text] : [];
+  });
+}
+
+function isString(value: string | undefined): value is string {
+  return value !== undefined && value.length > 0;
 }
 
 function compareSlackTs(left: string, right: string): number {

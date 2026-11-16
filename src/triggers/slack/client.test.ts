@@ -332,6 +332,90 @@ describe("Slack Web API client", () => {
     assert.equal(requests, 2);
   });
 
+  it("reads an app's post from its blocks and attachments, not only its fallback text", async () => {
+    const client = createSlackBotClient({
+      tokenForWorkspace: () => Promise.resolve("xoxb-secret"),
+      fetch: () =>
+        Promise.resolve(
+          Response.json({
+            ok: true,
+            messages: [
+              {
+                // Shape of a Sentry issue alert, trimmed.
+                ts: "1700000000.000000",
+                text: "[pulsify] capture",
+                user: "USENTRY",
+                bot_id: "BSENTRY",
+                attachments: null,
+                blocks: [
+                  {
+                    type: "section",
+                    text: { type: "mrkdwn", text: "<https://sentry.example/issues/1/|*capture*>" },
+                  },
+                  {
+                    type: "context",
+                    elements: [{ type: "mrkdwn", text: "POST /webhooks/email/:provider" }],
+                  },
+                  {
+                    type: "section",
+                    text: { type: "mrkdwn", text: "```Webhook notification handling failed```" },
+                  },
+                  {
+                    type: "actions",
+                    elements: [{ type: "button", text: { type: "plain_text", text: "Resolve" } }],
+                  },
+                  { type: "section", text: { type: 7 } },
+                ],
+              },
+              {
+                ts: "1700000000.000001",
+                text: "",
+                bot_id: "BLEGACY",
+                attachments: [
+                  {
+                    fallback: "Build failed",
+                    title: "Build 42 failed",
+                    title_link: "https://ci.example/42",
+                    fields: [{ title: "Branch", value: "main" }],
+                  },
+                  { fallback: "Only a fallback" },
+                  "not an attachment",
+                ],
+              },
+              {
+                ts: "1700000000.000002",
+                text: "typed by a person",
+                user: "U1",
+                blocks: [{ type: "rich_text", elements: [] }],
+              },
+            ],
+          }),
+        ),
+    });
+
+    const hydrated = await client.readThreadMessages?.({
+      organizationId: "org-1",
+      teamId: "T1",
+      channelId: "C1",
+      threadTs: "1700000000.000000",
+      beforeTs: "1700000000.000003",
+    });
+
+    assert.deepEqual(
+      hydrated?.messages.map((message) => message.content),
+      [
+        [
+          "[pulsify] capture",
+          "<https://sentry.example/issues/1/|*capture*>",
+          "POST /webhooks/email/:provider",
+          "```Webhook notification handling failed```",
+        ].join("\n"),
+        ["Build 42 failed (https://ci.example/42)", "Branch: main", "Only a fallback"].join("\n"),
+        "typed by a person",
+      ],
+    );
+  });
+
   it("rejects Slack thread context when the API omits its root", async () => {
     const client = createSlackBotClient({
       tokenForWorkspace: () => Promise.resolve("xoxb-secret"),
