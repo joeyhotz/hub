@@ -36,7 +36,7 @@ interface SlackThreadContextLocator {
 
 export interface SlackMergeData {
   slack: {
-    event_type: "app_mention";
+    event_type: "app_mention" | "message";
     event_id: string;
     event_ts: string;
     event_time: number;
@@ -112,13 +112,41 @@ export interface SlackOutputContext {
 
 type SlackReactionPhase = "accepted" | "started";
 
+const FOLLOW_THREAD_WINDOW_MS = 24 * 60 * 60 * 1_000;
+
+function slackConversationKey(event: NormalizedSlackMentionEvent): string {
+  return JSON.stringify([
+    "slack",
+    event.teamId,
+    event.channelId,
+    event.threadTs ?? event.messageTs,
+  ]);
+}
+
 export function createSlackTriggerProvider(options: {
   configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
   botUserIdForWorkspace(organizationId: string, teamId: string): Promise<string | undefined>;
   client: SlackBotClient;
   attachments?: AttachmentCapabilityRegistry;
   billingUrlForOrganization?: (organizationId: string) => Promise<string>;
+  /** When an agent last started in this conversation, for `follow_threads`. */
+  lastAgentStartInConversation?(projectId: string, key: string): Promise<Date | undefined>;
 }): TriggerProvider<"slack", SlackTriggerContext, SlackOutputContext, SlackMaterializedContext> {
+  // An un-mentioned thread reply is followed only while the bot is active in that thread.
+  async function followsThread(
+    triggers: readonly Pick<CompiledTriggerConfig, "on" | "filters">[],
+    event: NormalizedSlackMentionEvent,
+    projectId: string,
+  ): Promise<boolean> {
+    if (event.mentioned || event.channelType === "im" || event.threadTs === null) return false;
+    if (!triggers.some((candidate) => candidate.filters?.follow_threads === true)) return false;
+    const started = await options.lastAgentStartInConversation?.(
+      projectId,
+      slackConversationKey(event),
+    );
+    return started !== undefined && Date.now() - started.getTime() < FOLLOW_THREAD_WINDOW_MS;
+  }
+
   return {
     name: "slack",
     eventNames: ["slack.mention"],
@@ -143,6 +171,7 @@ export function createSlackTriggerProvider(options: {
         event,
         botUserId,
         trigger.connectionId,
+        await followsThread(stored.configuration.triggers, event, trigger.projectId),
       );
       if (matchedTriggers.length === 0) return "trigger_filters_rejected";
       const matches: TriggerProviderMatch<SlackTriggerContext, SlackOutputContext>[] = [];
@@ -178,12 +207,7 @@ export function createSlackTriggerProvider(options: {
         if (invocation.status === "rejected") {
           matches.push({
             conversation: {
-              key: JSON.stringify([
-                "slack",
-                rawEvent.teamId,
-                rawEvent.channelId,
-                rawEvent.threadTs ?? rawEvent.messageTs,
-              ]),
+              key: slackConversationKey(rawEvent),
               label: "Slack thread",
             },
             triggerName: match.trigger.name,
@@ -197,12 +221,7 @@ export function createSlackTriggerProvider(options: {
         }
         matches.push({
           conversation: {
-            key: JSON.stringify([
-              "slack",
-              rawEvent.teamId,
-              rawEvent.channelId,
-              rawEvent.threadTs ?? rawEvent.messageTs,
-            ]),
+            key: slackConversationKey(rawEvent),
             label: "Slack thread",
           },
           triggerName: match.trigger.name,
@@ -457,7 +476,7 @@ function buildSlackMergeData(
 ): SlackMergeData {
   return {
     slack: {
-      event_type: "app_mention",
+      event_type: event.mentioned ? "app_mention" : "message",
       event_id: event.id,
       event_ts: event.eventTs,
       event_time: event.eventTime,

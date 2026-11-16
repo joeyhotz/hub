@@ -16,23 +16,45 @@ export function matchSlackTriggers(
   event: NormalizedSlackMentionEvent,
   botUserId: string,
   connectionId?: string | null,
+  followedThread = false,
 ): MatchedSlackTrigger[] {
   if (event.author.id === botUserId) return [];
   return config.triggers.flatMap((trigger) => {
     return trigger.on === "slack.mention" &&
-      matchesFilters(event, trigger.filters, botUserId, connectionId)
+      matchesFilters(event, trigger.filters, botUserId, connectionId, followedThread)
       ? [{ event, trigger }]
       : [];
   });
+}
+
+/**
+ * Whether the message is addressed to the bot under this trigger. A mention always is. A message
+ * event is only when the trigger opts in: a direct message with `direct_messages`, or a reply in a
+ * thread the bot recently worked in with `follow_threads`. A channel reply that mentions the bot is
+ * left to its app_mention event, so one message never runs twice.
+ */
+export function isAddressed(
+  event: NormalizedSlackMentionEvent,
+  filters: TriggerFilter,
+  botUserId: string,
+  followedThread: boolean,
+): boolean {
+  if (event.mentioned) return event.content.includes(`<@${botUserId}>`);
+  if (event.channelType === "im") return filters.direct_messages === true;
+  return (
+    filters.follow_threads === true && followedThread && !event.content.includes(`<@${botUserId}>`)
+  );
 }
 
 function matchesFilters(
   event: NormalizedSlackMentionEvent,
   filters: TriggerFilter | undefined,
   botUserId: string,
-  connectionId?: string | null,
+  connectionId: string | null | undefined,
+  followedThread: boolean,
 ): boolean {
-  if (filters === undefined || !event.content.includes(`<@${botUserId}>`)) return false;
+  if (filters === undefined || !isAddressed(event, filters, botUserId, followedThread))
+    return false;
   if (
     filters.from_users === undefined ||
     (!filters.from_users.includes("*") &&

@@ -307,6 +307,51 @@ describe("Slack Phase 1 trigger provider", () => {
     assert.equal(client.reactions.at(-1), "org-1:T1:add:white_check_mark");
   });
 
+  it("follows a thread reply only while an agent started there in the last day", async () => {
+    const database = createMemoryDatabase();
+    const base = configuration();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      {
+        ...base,
+        triggers: [
+          { ...base.triggers[0]!, filters: { ...base.triggers[0]!.filters, follow_threads: true } },
+        ],
+      },
+      { organizationId: "org-1" },
+    );
+    const lookups: string[] = [];
+    const hour = 60 * 60 * 1_000;
+    const reply = external(project.id, revision.id, {
+      messageTs: "1700000000.000002",
+      content: "and the PDF too",
+    });
+    const event = {
+      ...reply,
+      payload: { ...reply.payload, mentioned: false, channelType: "channel" },
+    };
+    const results = [];
+    for (const lastStart of [
+      new Date(Date.now() - hour),
+      new Date(Date.now() - 25 * hour),
+      undefined,
+    ]) {
+      const provider = createSlackTriggerProvider({
+        configurationStoreForProject: () => store,
+        botUserIdForWorkspace: () => Promise.resolve("UBOT"),
+        client: new RecordingSlackClient(),
+        lastAgentStartInConversation: (_projectId, key) => {
+          lookups.push(key);
+          return Promise.resolve(lastStart);
+        },
+      });
+      const result = await provider.match(event);
+      results.push(Array.isArray(result) ? result.length : result);
+    }
+    assert.deepEqual(results, [1, "trigger_filters_rejected", "trigger_filters_rejected"]);
+    assert.equal(lookups[0], JSON.stringify(["slack", "T1", "C1", "1700000000.000001"]));
+  });
+
   it("keeps a root Slack mention as the reply thread root", async () => {
     const database = createMemoryDatabase();
     const { project, revision, store } = await createActiveProjectConfiguration(

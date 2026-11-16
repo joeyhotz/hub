@@ -104,6 +104,8 @@ describe("Slack webhook", () => {
       author: { id: "U123" },
       createdAt: "2023-11-14T22:13:20.000Z",
       attachments: [],
+      mentioned: true,
+      channelType: null,
     });
   });
 

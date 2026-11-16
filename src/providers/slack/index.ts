@@ -172,6 +172,14 @@ export function createSlackRegistration(
           ...(attachments === undefined ? {} : { attachments }),
           botUserIdForWorkspace: async (organizationId, teamId) =>
             (await findSlackBindingForOrganization(database, organizationId, teamId))?.botUserId,
+          lastAgentStartInConversation: async (projectId, key) => {
+            const session = await database.findAgentSessionByKey(projectId, key);
+            if (session === undefined) return undefined;
+            const starts = (await database.listAgentSessionExecutions(session.id)).map(
+              (execution) => execution.startedAt.getTime(),
+            );
+            return starts.length === 0 ? undefined : new Date(Math.max(...starts));
+          },
           client: bot,
         }),
     ],

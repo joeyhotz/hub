@@ -102,6 +102,10 @@ const AuthoredTriggerFilterSchema = z
     assignees: z.array(z.string().min(1)).min(1).optional(),
     channels: z.array(z.string().min(1)).optional(),
     from_users: z.array(z.string().min(1)).optional(),
+    /** Slack: a direct message to the bot runs the trigger without a mention. */
+    direct_messages: z.boolean().optional(),
+    /** Slack: a reply in a thread the bot worked in during the last day runs it without a mention. */
+    follow_threads: z.boolean().optional(),
     inputs: z.record(z.string(), InputValueSchema).optional(),
     connection: z
       .string()
