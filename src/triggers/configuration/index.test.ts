@@ -101,6 +101,18 @@ describe("self-contained trigger documents", () => {
     );
   });
 
+  it("carries the Slack direct_messages and follow_threads filters into the compiled trigger", () => {
+    const compiled = compileTriggerDocument(
+      trigger.replace(
+        "      channels: [engineering]\n",
+        "      channels: [engineering]\n      direct_messages: true\n      follow_threads: true\n",
+      ),
+    );
+    const slack = compiled.events.find((event) => event.on === "slack.mention");
+    assert.equal(slack?.filters?.direct_messages, true);
+    assert.equal(slack?.filters?.follow_threads, true);
+  });
+
   it("rejects a non-boolean background value", () => {
     assert.throws(
       () => parseTriggerDocument(trigger.replace("run:", 'run:\n  background: "true"')),
