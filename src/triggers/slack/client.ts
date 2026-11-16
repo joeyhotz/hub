@@ -84,6 +84,14 @@ export interface SlackBotClient {
     messageTs: string;
     name: string;
   }): Promise<void>;
+  /** Slack's agent session status for a thread: `processing` while an agent works. */
+  setThreadStatus?(input: {
+    organizationId: string;
+    teamId: string;
+    channelId: string;
+    threadTs: string;
+    status: "processing" | "active";
+  }): Promise<void>;
   readThreadMessages?(input: {
     organizationId: string;
     teamId: string;
@@ -300,6 +308,12 @@ export function createSlackBotClient(options: {
         { channel: input.channelId, timestamp: input.messageTs, name: input.name },
         ["no_reaction", ...SLACK_REACTION_TARGET_GONE],
       ),
+    setThreadStatus: (input) =>
+      call(input.organizationId, input.teamId, "agents.sessions.setStatus", {
+        channel_id: input.channelId,
+        thread_ts: input.threadTs,
+        status: input.status,
+      }),
     readThreadMessages,
     lookupUserName,
     downloadAttachment,

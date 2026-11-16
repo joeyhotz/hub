@@ -315,14 +315,17 @@ export function createSlackTriggerProvider(options: {
     async onAgentExecutionStarted(context, _outputContext, reactionState) {
       if (slackReactionPhase(reactionState) === "started") return reactionState;
       await replaceReaction(options.client, context.target, "eyes", "hourglass_flowing_sand");
+      await setThreadStatusSafely(options.client, context.target, "processing");
       return { phase: "started" };
     },
     async onAgentExecutionCompleted(context, _outputContext, _result, reactionState) {
+      await setThreadStatusSafely(options.client, context.target, "active");
       await removeReactionForPhase(options.client, context.target, reactionState, "started");
       await addReaction(options.client, context.target, "white_check_mark");
       return null;
     },
     async onAgentExecutionFailed(context, _output, reason, reactionState) {
+      await setThreadStatusSafely(options.client, context.target, "active");
       await failWithNotice(
         options.client,
         context.target,
@@ -337,6 +340,7 @@ export function createSlackTriggerProvider(options: {
     },
     async onMachineTerminated(context, reason, reactionState) {
       if (reason === "launch_failed" || reason === "daemon_disconnected") {
+        await setThreadStatusSafely(options.client, context.target, "active");
         await failWithNotice(
           options.client,
           context.target,
@@ -497,6 +501,30 @@ async function replaceReaction(
 ): Promise<void> {
   await removeReactionSafely(client, event, from);
   await addReactionSafely(client, event, to);
+}
+
+/** Status is a courtesy: Slack drops `processing` after an hour, so a failed call never blocks a run. */
+async function setThreadStatusSafely(
+  client: SlackBotClient,
+  event: SlackOutputContext,
+  status: "processing" | "active",
+): Promise<void> {
+  if (client.setThreadStatus === undefined) return;
+  try {
+    await client.setThreadStatus({
+      organizationId: event.organizationId,
+      teamId: event.teamId,
+      channelId: event.channelId,
+      threadTs: event.threadTs,
+      status,
+    });
+  } catch (error) {
+    reportFailure(
+      error,
+      { operation: "slack.thread.status", component: "triggers", provider: "slack" },
+      { diagnostic: { teamId: event.teamId, status } },
+    );
+  }
 }
 
 async function failWithNotice(

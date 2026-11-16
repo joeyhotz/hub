@@ -249,6 +249,62 @@ describe("Slack Phase 1 trigger provider", () => {
     ]);
   });
 
+  it("shows the thread as processing while the agent runs and clears it at the end", async () => {
+    const database = createMemoryDatabase();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      configuration(),
+      { organizationId: "org-1" },
+    );
+    for (const outcome of ["completed", "failed", "terminated"] as const) {
+      const client = new RecordingSlackClient();
+      const provider = createSlackTriggerProvider({
+        configurationStoreForProject: () => store,
+        botUserIdForWorkspace: () => Promise.resolve("UBOT"),
+        client,
+      });
+      const match = (await provider.match(external(project.id, revision.id)))[0];
+      if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+      await provider.onAgentExecutionStarted?.(match.triggerContext, match.outputContext);
+      const thread = `${match.outputContext.channelId}:${match.outputContext.threadTs}`;
+      assert.deepEqual(client.statuses, [`${thread}:processing`]);
+      if (outcome === "completed")
+        await provider.onAgentExecutionCompleted?.(match.triggerContext, match.outputContext, {
+          status: "succeeded",
+        });
+      if (outcome === "failed")
+        await provider.onAgentExecutionFailed?.(match.triggerContext, match.outputContext, "boom");
+      if (outcome === "terminated")
+        await provider.onMachineTerminated?.(match.triggerContext, "daemon_disconnected");
+      assert.deepEqual(client.statuses, [`${thread}:processing`, `${thread}:active`], outcome);
+    }
+  });
+
+  it("runs the agent even when Slack rejects the thread status", async () => {
+    const database = createMemoryDatabase();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      configuration(),
+      { organizationId: "org-1" },
+    );
+    const client = new RecordingSlackClient({ failStatus: true });
+    const provider = createSlackTriggerProvider({
+      configurationStoreForProject: () => store,
+      botUserIdForWorkspace: () => Promise.resolve("UBOT"),
+      client,
+    });
+    const match = (await provider.match(external(project.id, revision.id)))[0];
+    if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+    assert.deepEqual(
+      await provider.onAgentExecutionStarted?.(match.triggerContext, match.outputContext),
+      { phase: "started" },
+    );
+    await provider.onAgentExecutionCompleted?.(match.triggerContext, match.outputContext, {
+      status: "succeeded",
+    });
+    assert.equal(client.reactions.at(-1), "org-1:T1:add:white_check_mark");
+  });
+
   it("keeps a root Slack mention as the reply thread root", async () => {
     const database = createMemoryDatabase();
     const { project, revision, store } = await createActiveProjectConfiguration(
@@ -960,6 +1016,7 @@ class RecordingSlackClient implements SlackBotClient {
   }> = [];
   threadReads: string[] = [];
   userLookups: string[] = [];
+  statuses: string[] = [];
   private readonly threadMessages: SlackThreadMessage[];
 
   constructor(
@@ -970,6 +1027,7 @@ class RecordingSlackClient implements SlackBotClient {
       failThreadRead?: boolean;
       threadComplete?: boolean;
       username?: string;
+      failStatus?: boolean;
     } = {},
   ) {
     this.threadMessages = options.threadMessages ?? [];
@@ -991,6 +1049,11 @@ class RecordingSlackClient implements SlackBotClient {
 
   removeReaction(input: { organizationId: string; teamId: string; name: string }): Promise<void> {
     this.reactions.push(`${input.organizationId}:${input.teamId}:remove:${input.name}`);
+    return Promise.resolve();
+  }
+  setThreadStatus(input: { channelId: string; threadTs: string; status: string }): Promise<void> {
+    this.statuses.push(`${input.channelId}:${input.threadTs}:${input.status}`);
+    if (this.options.failStatus === true) return Promise.reject(new Error("slack status failed"));
     return Promise.resolve();
   }
   lookupUserName(input: { userId: string }): Promise<string | undefined> {

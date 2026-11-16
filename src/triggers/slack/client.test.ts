@@ -23,6 +23,33 @@ describe("Slack Web API client", () => {
     });
   });
 
+  it("sets a thread's agent session status", async () => {
+    const requests: Array<{ url: string; body: unknown }> = [];
+    const client = createSlackBotClient({
+      tokenForWorkspace: () => Promise.resolve("xoxb-secret"),
+      fetch: async (input, init) => {
+        requests.push({
+          url: requestUrl(input),
+          body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+        });
+        return Response.json({ ok: true, status: "processing" });
+      },
+    });
+    await client.setThreadStatus?.({
+      organizationId: "org-1",
+      teamId: "T1",
+      channelId: "C1",
+      threadTs: "1.1",
+      status: "processing",
+    });
+    assert.deepEqual(requests, [
+      {
+        url: "https://slack.com/api/agents.sessions.setStatus",
+        body: { channel_id: "C1", thread_ts: "1.1", status: "processing" },
+      },
+    ]);
+  });
+
   it("resolves the workspace token internally and checks Slack's ok field", async () => {
     const requests: Array<{ url: string; authorization: string | null; body: unknown }> = [];
     const authorities: Array<[string, string]> = [];
