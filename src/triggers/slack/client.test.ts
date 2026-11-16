@@ -23,6 +23,35 @@ describe("Slack Web API client", () => {
     });
   });
 
+  it("prefers a member's display name, then real name, then handle", async () => {
+    const users: Record<string, unknown> = {
+      U1: {
+        name: "joey",
+        real_name: "Joey Hotz",
+        profile: { display_name: "Joey", real_name: "Joey Hotz" },
+      },
+      U2: {
+        name: "dhruv",
+        real_name: "Dhruv K",
+        profile: { display_name: "", real_name: "Dhruv K" },
+      },
+      U3: { name: "liam", profile: { display_name: " " } },
+    };
+    const client = createSlackBotClient({
+      tokenForWorkspace: () => Promise.resolve("xoxb-secret"),
+      fetch: async (input) => {
+        const user = new URL(requestUrl(input)).searchParams.get("user") ?? "";
+        return Response.json({ ok: true, user: users[user] });
+      },
+    });
+    const names = [];
+    for (const userId of ["U1", "U2", "U3"])
+      names.push(
+        await client.lookupUserDisplayName?.({ organizationId: "org-1", teamId: "T1", userId }),
+      );
+    assert.deepEqual(names, ["Joey", "Dhruv K", "liam"]);
+  });
+
   it("sets a thread's agent session status", async () => {
     const requests: Array<{ url: string; body: unknown }> = [];
     const client = createSlackBotClient({

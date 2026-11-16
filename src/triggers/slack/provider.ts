@@ -81,6 +81,8 @@ interface SlackContextPayload {
  */
 interface SlackMaterializedTriggerMessage {
   ts: string;
+  /** Who posted the message; `name` is their Slack display name, or null when Slack has none. */
+  author: { id: string; name: string | null };
   channel: { id: string };
   thread: { ts: string } | null;
   attachments: AttachmentDescriptor[];
@@ -215,10 +217,19 @@ export function createSlackTriggerProvider(options: {
     },
     async materializeContext(launch): Promise<SlackMaterializedContext> {
       const locator = launch.triggerContext.event.slack.trigger_thread_context;
-      const { ts, channel, thread, attachments } =
+      const { ts, author, channel, thread, attachments } =
         launch.triggerContext.event.slack.trigger_message;
       const triggerMessage: SlackMaterializedTriggerMessage = {
         ts,
+        author: {
+          id: author.id,
+          name: await readDisplayName(
+            options.client,
+            launch.organizationId,
+            launch.triggerContext.event.slack.team.id,
+            author.id,
+          ),
+        },
         channel: { id: channel.id },
         thread: thread === null ? null : { ts: thread.ts },
         attachments: await registerAttachments(
@@ -339,8 +350,9 @@ export function createSlackTriggerProvider(options: {
       return null;
     },
     async onMachineTerminated(context, reason, reactionState) {
+      // Every ending clears the status; only these two also mark the message failed.
+      await setThreadStatusSafely(options.client, context.target, "active");
       if (reason === "launch_failed" || reason === "daemon_disconnected") {
-        await setThreadStatusSafely(options.client, context.target, "active");
         await failWithNotice(
           options.client,
           context.target,
@@ -352,6 +364,25 @@ export function createSlackTriggerProvider(options: {
       return reactionState;
     },
   };
+}
+
+async function readDisplayName(
+  client: SlackBotClient,
+  organizationId: string,
+  teamId: string,
+  userId: string,
+): Promise<string | null> {
+  if (client.lookupUserDisplayName === undefined) return null;
+  try {
+    return (await client.lookupUserDisplayName({ organizationId, teamId, userId })) ?? null;
+  } catch (error) {
+    reportFailure(
+      error,
+      { operation: "slack.user.display_name", component: "triggers", provider: "slack" },
+      { diagnostic: { teamId, userId } },
+    );
+    return null;
+  }
 }
 
 async function enrichSlackAuthor(

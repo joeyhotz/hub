@@ -256,7 +256,7 @@ describe("Slack Phase 1 trigger provider", () => {
       configuration(),
       { organizationId: "org-1" },
     );
-    for (const outcome of ["completed", "failed", "terminated"] as const) {
+    for (const outcome of ["completed", "failed", "terminated", "cancelled"] as const) {
       const client = new RecordingSlackClient();
       const provider = createSlackTriggerProvider({
         configurationStoreForProject: () => store,
@@ -276,6 +276,8 @@ describe("Slack Phase 1 trigger provider", () => {
         await provider.onAgentExecutionFailed?.(match.triggerContext, match.outputContext, "boom");
       if (outcome === "terminated")
         await provider.onMachineTerminated?.(match.triggerContext, "daemon_disconnected");
+      if (outcome === "cancelled")
+        await provider.onMachineTerminated?.(match.triggerContext, "cancelled");
       assert.deepEqual(client.statuses, [`${thread}:processing`, `${thread}:active`], outcome);
     }
   });
@@ -477,6 +479,7 @@ describe("Slack Phase 1 trigger provider", () => {
       slack: {
         trigger_message: {
           ts: "1700000000.000001",
+          author: { id: "U1", name: null },
           channel: { id: "C1" },
           thread: null,
           attachments: [],
@@ -555,6 +558,7 @@ describe("Slack Phase 1 trigger provider", () => {
       slack: {
         trigger_message: {
           ts: "1700000000.000001",
+          author: { id: "U1", name: null },
           channel: { id: "C1" },
           thread: { ts: "1700000000.000001" },
           attachments: [],
@@ -661,6 +665,37 @@ describe("Slack Phase 1 trigger provider", () => {
     }
   });
 
+  it("names the author of the triggering message in context", async () => {
+    const database = createMemoryDatabase();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      configuration(),
+      { organizationId: "org-1" },
+    );
+    for (const [displayName, expected] of [
+      ["Joey", "Joey"],
+      [undefined, null],
+    ] as const) {
+      const provider = createSlackTriggerProvider({
+        configurationStoreForProject: () => store,
+        botUserIdForWorkspace: () => Promise.resolve("UBOT"),
+        client: new RecordingSlackClient(displayName === undefined ? {} : { displayName }),
+      });
+      const match = (
+        await provider.match(external(project.id, revision.id, { threadTs: null }))
+      )[0];
+      if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+      const context = await provider.materializeContext!({
+        executionId: "execution-slack-author",
+        organizationId: "org-1",
+        projectId: project.id,
+        providerEventReceiptId: "11111111-1111-4111-8111-111111111120",
+        triggerContext: match.triggerContext,
+      });
+      assert.deepEqual(context?.slack.trigger_message.author, { id: "U1", name: expected });
+    }
+  });
+
   it("distinguishes an unavailable Slack thread from an empty hydrated thread", async () => {
     const database = createMemoryDatabase();
     const { project, revision, store } = await createActiveProjectConfiguration(
@@ -691,6 +726,7 @@ describe("Slack Phase 1 trigger provider", () => {
       slack: {
         trigger_message: {
           ts: "1700000000.000001",
+          author: { id: "U1", name: null },
           channel: { id: "C1" },
           thread: { ts: "1700000000.000001" },
           attachments: [],
@@ -718,6 +754,7 @@ describe("Slack Phase 1 trigger provider", () => {
       slack: {
         trigger_message: {
           ts: "1700000000.000001",
+          author: { id: "U1", name: null },
           channel: { id: "C1" },
           thread: { ts: "1700000000.000001" },
           attachments: [],
@@ -776,7 +813,9 @@ describe("Slack Phase 1 trigger provider", () => {
     );
     const client = createSlackBotClient({
       tokenForWorkspace: () => Promise.resolve("xoxb-secret"),
-      fetch: () => {
+      fetch: (input) => {
+        if (String(input instanceof Request ? input.url : input).includes("users.info"))
+          return Promise.resolve(Response.json({ ok: true, user: { name: "operator" } }));
         requests += 1;
         if (requests > maximumPageCount) {
           throw new Error("Slack history traversal exceeded its request ceiling");
@@ -1028,6 +1067,7 @@ class RecordingSlackClient implements SlackBotClient {
       threadComplete?: boolean;
       username?: string;
       failStatus?: boolean;
+      displayName?: string;
     } = {},
   ) {
     this.threadMessages = options.threadMessages ?? [];
@@ -1055,6 +1095,9 @@ class RecordingSlackClient implements SlackBotClient {
     this.statuses.push(`${input.channelId}:${input.threadTs}:${input.status}`);
     if (this.options.failStatus === true) return Promise.reject(new Error("slack status failed"));
     return Promise.resolve();
+  }
+  lookupUserDisplayName(input: { userId: string }): Promise<string | undefined> {
+    return Promise.resolve(input.userId === "U1" ? this.options.displayName : undefined);
   }
   lookupUserName(input: { userId: string }): Promise<string | undefined> {
     this.userLookups.push(input.userId);

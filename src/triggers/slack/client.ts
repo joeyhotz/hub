@@ -35,7 +35,18 @@ const SlackFileInfoSchema = SlackApiResponseSchema.extend({
     .optional(),
 });
 const SlackUserInfoSchema = SlackApiResponseSchema.extend({
-  user: z.object({ name: z.string().min(1).max(255) }).optional(),
+  user: z
+    .object({
+      name: z.string().min(1).max(255),
+      real_name: z.string().max(255).optional(),
+      profile: z
+        .object({
+          display_name: z.string().max(255).optional(),
+          real_name: z.string().max(255).optional(),
+        })
+        .optional(),
+    })
+    .optional(),
 });
 const SLACK_API_TIMEOUT_MS = 10_000;
 const SLACK_THREAD_REPLIES_MAX_PAGES = 10;
@@ -100,6 +111,12 @@ export interface SlackBotClient {
     beforeTs: string;
   }): Promise<SlackThreadReadResult>;
   lookupUserName?(input: {
+    organizationId: string;
+    teamId: string;
+    userId: string;
+  }): Promise<string | undefined>;
+  /** The name Slack shows for a member: display name, else real name, else handle. */
+  lookupUserDisplayName?(input: {
     organizationId: string;
     teamId: string;
     userId: string;
@@ -282,6 +299,24 @@ export function createSlackBotClient(options: {
     return result.user?.name;
   }
 
+  async function lookupUserDisplayName(input: {
+    organizationId: string;
+    teamId: string;
+    userId: string;
+  }): Promise<string | undefined> {
+    const result = SlackUserInfoSchema.parse(
+      await queryJson(input.organizationId, input.teamId, "users.info", { user: input.userId }),
+    );
+    if (!result.ok) throw new SlackApiError(result.error);
+    const user = result.user;
+    return [
+      user?.profile?.display_name,
+      user?.profile?.real_name,
+      user?.real_name,
+      user?.name,
+    ].find((name) => name !== undefined && name.trim().length > 0);
+  }
+
   return {
     sendMessage: (input) =>
       call(input.organizationId, input.teamId, "chat.postMessage", {
@@ -316,6 +351,7 @@ export function createSlackBotClient(options: {
       }),
     readThreadMessages,
     lookupUserName,
+    lookupUserDisplayName,
     downloadAttachment,
   };
 }
