@@ -14,6 +14,7 @@ import {
 import type { SlackBotClient, SlackThreadMessage } from "./client.js";
 import { NormalizedSlackMentionEventSchema, type NormalizedSlackMentionEvent } from "./events.js";
 import {
+  type MatchedSlackTrigger,
   matchSlackTriggers,
   readSlackInvocationParserMessage,
   readSlackPromptBody,
@@ -114,6 +115,29 @@ type SlackReactionPhase = "accepted" | "started";
 
 const FOLLOW_THREAD_WINDOW_MS = 24 * 60 * 60 * 1_000;
 
+interface ConversationAccess {
+  /** A direct message or group DM. */
+  direct: boolean;
+  /** Who added the bot to the channel, when Slack recorded it. */
+  inviter: string | null;
+}
+
+function allowsConversation(
+  filters: NonNullable<CompiledTriggerConfig["filters"]>,
+  access: ConversationAccess | undefined,
+  authorId: string,
+): boolean {
+  if (access === undefined) return false;
+  if (access.direct)
+    return (
+      filters.direct_message_users === undefined || filters.direct_message_users.includes(authorId)
+    );
+  return (
+    filters.channel_inviters === undefined ||
+    (access.inviter !== null && filters.channel_inviters.includes(access.inviter))
+  );
+}
+
 function slackConversationKey(event: NormalizedSlackMentionEvent): string {
   return JSON.stringify([
     "slack",
@@ -147,6 +171,129 @@ export function createSlackTriggerProvider(options: {
     return started !== undefined && Date.now() - started.getTime() < FOLLOW_THREAD_WINDOW_MS;
   }
 
+  // The bot's latest join per channel, from history or a join event. Each use re-reads only
+  // newer history, so a removal and a re-add by someone else is seen at the next message.
+  const botJoins = new Map<string, { inviter: string | null; checkedTs: string }>();
+  const conversationKinds = new Map<string, "im" | "mpim" | "channel">();
+
+  async function channelInviter(
+    organizationId: string,
+    event: NormalizedSlackMentionEvent,
+    botUserId: string,
+  ): Promise<string | null> {
+    if (options.client.findChannelJoin === undefined)
+      throw new Error("Slack channel history is unavailable");
+    const key = `${event.teamId}:${event.channelId}`;
+    const known = botJoins.get(key);
+    const found = await options.client.findChannelJoin({
+      organizationId,
+      teamId: event.teamId,
+      channelId: event.channelId,
+      userId: botUserId,
+      ...(known === undefined ? {} : { oldest: known.checkedTs }),
+    });
+    const latest = found.join ?? known;
+    if (latest === undefined) return null;
+    botJoins.set(key, {
+      inviter: latest.inviter,
+      checkedTs: found.newestTs ?? known?.checkedTs ?? event.messageTs,
+    });
+    return latest.inviter;
+  }
+
+  async function conversationKind(
+    organizationId: string,
+    event: NormalizedSlackMentionEvent,
+  ): Promise<"im" | "mpim" | "channel"> {
+    if (event.channelType === "im") return "im";
+    if (event.channelType !== null) return "channel";
+    const key = `${event.teamId}:${event.channelId}`;
+    const known = conversationKinds.get(key);
+    if (known !== undefined) return known;
+    if (options.client.readConversationKind === undefined)
+      throw new Error("Slack conversation info is unavailable");
+    const kind = await options.client.readConversationKind({
+      organizationId,
+      teamId: event.teamId,
+      channelId: event.channelId,
+    });
+    conversationKinds.set(key, kind);
+    return kind;
+  }
+
+  /** Group DMs count as direct messages. Undefined when Slack could not say, which refuses. */
+  async function readConversationAccess(
+    organizationId: string,
+    event: NormalizedSlackMentionEvent,
+    botUserId: string,
+  ): Promise<ConversationAccess | undefined> {
+    try {
+      if ((await conversationKind(organizationId, event)) !== "channel")
+        return { direct: true, inviter: null };
+      return { direct: false, inviter: await channelInviter(organizationId, event, botUserId) };
+    } catch (error) {
+      reportFailure(
+        error,
+        { operation: "slack.conversation.access", component: "triggers", provider: "slack" },
+        { diagnostic: { teamId: event.teamId, channelId: event.channelId } },
+      );
+      return undefined;
+    }
+  }
+
+  /** Applies `channel_inviters` and `direct_message_users`, reading Slack at most once. */
+  async function permittedTriggers(
+    matched: MatchedSlackTrigger[],
+    organizationId: string,
+    event: NormalizedSlackMentionEvent,
+    botUserId: string,
+  ): Promise<MatchedSlackTrigger[]> {
+    let access: Promise<ConversationAccess | undefined> | undefined;
+    const permitted = [];
+    for (const match of matched) {
+      const filters = match.trigger.filters;
+      if (filters?.channel_inviters !== undefined || filters?.direct_message_users !== undefined) {
+        access ??= readConversationAccess(organizationId, event, botUserId);
+        if (!allowsConversation(filters, await access, event.author.id)) continue;
+      }
+      permitted.push(match);
+    }
+    return permitted;
+  }
+
+  /** Records the bot's own join, and leaves at once when no trigger accepts that inviter. */
+  async function handleJoin(
+    organizationId: string,
+    event: NormalizedSlackMentionEvent,
+    botUserId: string,
+    triggers: readonly Pick<CompiledTriggerConfig, "on" | "filters">[],
+  ): Promise<void> {
+    if (event.join === undefined || event.author.id !== botUserId) return;
+    const { inviter } = event.join;
+    botJoins.set(`${event.teamId}:${event.channelId}`, { inviter, checkedTs: event.messageTs });
+    const slackTriggers = triggers.filter((candidate) => candidate.on === "slack.mention");
+    const accepted = slackTriggers.some(
+      (candidate) =>
+        candidate.filters !== undefined &&
+        (candidate.filters.channel_inviters === undefined ||
+          (inviter !== null && candidate.filters.channel_inviters.includes(inviter))),
+    );
+    if (accepted || !slackTriggers.some((candidate) => candidate.filters?.channel_inviters)) return;
+    try {
+      await options.client.leaveChannel?.({
+        organizationId,
+        teamId: event.teamId,
+        channelId: event.channelId,
+      });
+    } catch (error) {
+      reportFailure(
+        error,
+        { operation: "slack.channel.leave", component: "triggers", provider: "slack" },
+        { diagnostic: { teamId: event.teamId, channelId: event.channelId } },
+      );
+    }
+  }
+
   return {
     name: "slack",
     eventNames: ["slack.mention"],
@@ -163,6 +310,15 @@ export function createSlackTriggerProvider(options: {
       if (stored === undefined) return "configuration_unavailable";
       if (!stored.configuration.triggers.some((candidate) => candidate.on === trigger.source))
         return "no_trigger_for_source";
+      if (rawEvent.join !== undefined) {
+        await handleJoin(
+          trigger.organizationId,
+          rawEvent,
+          botUserId,
+          stored.configuration.triggers,
+        );
+        return "trigger_filters_rejected";
+      }
       const event = needsSlackUsername(stored.configuration.triggers, rawEvent.author.id)
         ? await enrichSlackAuthor(rawEvent, trigger.organizationId, options.client)
         : rawEvent;
@@ -173,10 +329,16 @@ export function createSlackTriggerProvider(options: {
         trigger.connectionId,
         await followsThread(stored.configuration.triggers, event, trigger.projectId),
       );
-      if (matchedTriggers.length === 0) return "trigger_filters_rejected";
+      const permitted = await permittedTriggers(
+        matchedTriggers,
+        trigger.organizationId,
+        event,
+        botUserId,
+      );
+      if (permitted.length === 0) return "trigger_filters_rejected";
       const matches: TriggerProviderMatch<SlackTriggerContext, SlackOutputContext>[] = [];
 
-      for (const match of matchedTriggers) {
+      for (const match of permitted) {
         const compiledTrigger = stored.configuration.triggers.find(
           (candidate) => candidate.name === match.trigger.name,
         );

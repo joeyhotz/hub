@@ -479,6 +479,80 @@ describe("Slack Web API client", () => {
       },
     ]);
   });
+
+  it("finds who most recently added a member to a channel from its join message", async () => {
+    const urls: URL[] = [];
+    const pages = [
+      [
+        { ts: "1700000000.000009", text: "latest", user: "U1" },
+        { ts: "1700000000.000008", subtype: "channel_join", user: "U3", inviter: "U1" },
+      ],
+      [
+        { ts: "1700000000.000005", subtype: "channel_join", user: "UBOT", inviter: "U2" },
+        { ts: "1700000000.000002", subtype: "channel_join", user: "UBOT", inviter: "U1" },
+      ],
+    ];
+    const client = createSlackBotClient({
+      tokenForWorkspace: () => Promise.resolve("xoxb-secret"),
+      fetch: async (input) => {
+        const url = new URL(requestUrl(input));
+        urls.push(url);
+        const page = url.searchParams.get("cursor") === null ? 0 : 1;
+        return Response.json({
+          ok: true,
+          messages: pages[page],
+          response_metadata: { next_cursor: page === 0 ? "next" : "" },
+        });
+      },
+    });
+    const input = { organizationId: "org-1", teamId: "T1", channelId: "C1", userId: "UBOT" };
+
+    assert.deepEqual(await client.findChannelJoin?.(input), {
+      join: { inviter: "U2" },
+      newestTs: "1700000000.000009",
+    });
+    assert.equal(urls[0]?.pathname, "/api/conversations.history");
+    assert.equal(urls[0]?.searchParams.get("channel"), "C1");
+    assert.equal(urls[0]?.searchParams.get("oldest"), null);
+
+    urls.length = 0;
+    pages[0] = [];
+    pages[1] = [];
+    assert.deepEqual(await client.findChannelJoin?.({ ...input, oldest: "1700000000.000009" }), {
+      join: undefined,
+      newestTs: undefined,
+    });
+    assert.equal(urls[0]?.searchParams.get("oldest"), "1700000000.000009");
+  });
+
+  it("names a group DM and leaves a channel", async () => {
+    const calls: string[] = [];
+    const client = createSlackBotClient({
+      tokenForWorkspace: () => Promise.resolve("xoxb-secret"),
+      fetch: async (input, init) => {
+        const url = new URL(requestUrl(input));
+        const body = typeof init?.body === "string" ? init.body : "";
+        calls.push(`${init?.method} ${url.pathname} ${url.searchParams.get("channel") ?? body}`);
+        const channel = url.searchParams.get("channel");
+        return Response.json({
+          ok: true,
+          channel: { id: channel, is_im: channel === "D1", is_mpim: channel === "G1" },
+        });
+      },
+    });
+    const at = { organizationId: "org-1", teamId: "T1" };
+
+    assert.deepEqual(
+      [
+        await client.readConversationKind?.({ ...at, channelId: "D1" }),
+        await client.readConversationKind?.({ ...at, channelId: "G1" }),
+        await client.readConversationKind?.({ ...at, channelId: "C1" }),
+      ],
+      ["im", "mpim", "channel"],
+    );
+    await client.leaveChannel?.({ ...at, channelId: "C1" });
+    assert.equal(calls.at(-1), 'POST /api/conversations.leave {"channel":"C1"}');
+  });
 });
 
 function requestUrl(input: RequestInfo | URL): string {

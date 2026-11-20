@@ -352,6 +352,105 @@ describe("Slack Phase 1 trigger provider", () => {
     assert.equal(lookups[0], JSON.stringify(["slack", "T1", "C1", "1700000000.000001"]));
   });
 
+  it("runs in a channel only when a listed member added the bot, re-checking for a later join", async () => {
+    const { project, revision, store } = await accessConfiguration({ channel_inviters: ["U1"] });
+    const event = external(project.id, revision.id);
+    const outcomes = async (joins: Array<FoundJoin | Error>) => {
+      const client = new RecordingSlackClient({ joins });
+      const provider = createSlackTriggerProvider({
+        configurationStoreForProject: () => store,
+        botUserIdForWorkspace: () => Promise.resolve("UBOT"),
+        client,
+      });
+      const results = [];
+      for (const _ of joins) {
+        const result = await provider.match(event);
+        results.push(Array.isArray(result) ? result.length : result);
+      }
+      return { results, lookups: client.joinLookups };
+    };
+
+    const later = await outcomes([
+      { join: { inviter: "U1" }, newestTs: "1700000000.000001" },
+      { join: undefined, newestTs: undefined },
+      { join: { inviter: "U2" }, newestTs: "1700000000.000009" },
+    ]);
+    assert.deepEqual(later.results, [1, 1, "trigger_filters_rejected"]);
+    assert.deepEqual(later.lookups, [
+      "C1:UBOT:-",
+      "C1:UBOT:1700000000.000001",
+      "C1:UBOT:1700000000.000001",
+    ]);
+
+    const unknown = await outcomes([
+      { join: { inviter: null }, newestTs: "1700000000.000001" },
+      { join: undefined, newestTs: "1700000000.000001" },
+      new Error("ratelimited"),
+    ]);
+    assert.deepEqual(unknown.results, Array(3).fill("trigger_filters_rejected"));
+  });
+
+  it("leaves a channel it was added to by an unlisted member, without posting", async () => {
+    const { project, revision, store } = await accessConfiguration({ channel_inviters: ["U1"] });
+    const join = (inviter: string | null, authorId = "UBOT") => {
+      const base = external(project.id, revision.id, { authorId, threadTs: null });
+      return {
+        ...base,
+        payload: { ...base.payload, mentioned: false, channelType: "group", join: { inviter } },
+      };
+    };
+    const client = new RecordingSlackClient();
+    const provider = createSlackTriggerProvider({
+      configurationStoreForProject: () => store,
+      botUserIdForWorkspace: () => Promise.resolve("UBOT"),
+      client,
+    });
+
+    for (const event of [join("U2"), join(null), join("U1"), join("U2", "U3")])
+      assert.equal(await provider.match(event), "trigger_filters_rejected");
+
+    assert.deepEqual(client.leaves, ["C1", "C1"]);
+    assert.deepEqual(client.messages, []);
+    assert.deepEqual(client.reactions, []);
+    // The join just seen is the record: a mention right after it reads only newer history.
+    assert.equal((await provider.match(external(project.id, revision.id))).length, 1);
+    assert.deepEqual(client.joinLookups, ["C1:UBOT:1700000000.000001"]);
+  });
+
+  it("runs a direct message, or a mention in a group DM, only from a listed member", async () => {
+    const { project, revision, store } = await accessConfiguration({
+      direct_message_users: ["U1"],
+      channel_inviters: ["U9"],
+      from_users: ["U1", "U2"],
+    });
+    const client = new RecordingSlackClient({ kinds: { G1: "mpim" } });
+    const provider = createSlackTriggerProvider({
+      configurationStoreForProject: () => store,
+      botUserIdForWorkspace: () => Promise.resolve("UBOT"),
+      client,
+    });
+    const dm = (authorId: string) => {
+      const base = external(project.id, revision.id, { authorId, content: "hello" });
+      return {
+        ...base,
+        payload: { ...base.payload, channelId: "D1", mentioned: false, channelType: "im" },
+      };
+    };
+    const groupMention = (authorId: string) => {
+      const base = external(project.id, revision.id, { authorId });
+      return { ...base, payload: { ...base.payload, channelId: "G1" } };
+    };
+
+    const results = [];
+    for (const event of [dm("U1"), dm("U2"), groupMention("U1"), groupMention("U2")]) {
+      const result = await provider.match(event);
+      results.push(Array.isArray(result) ? result.length : result);
+    }
+    assert.deepEqual(results, [1, "trigger_filters_rejected", 1, "trigger_filters_rejected"]);
+    // Group DMs follow the direct-message rule, never the inviter rule.
+    assert.deepEqual(client.joinLookups, []);
+  });
+
   it("keeps a root Slack mention as the reply thread root", async () => {
     const database = createMemoryDatabase();
     const { project, revision, store } = await createActiveProjectConfiguration(
@@ -1053,6 +1152,34 @@ function inputMarkerConfiguration() {
   };
 }
 
+interface FoundJoin {
+  join: { inviter: string | null } | undefined;
+  newestTs: string | undefined;
+}
+
+async function accessConfiguration(filters: Record<string, unknown>) {
+  const base = configuration();
+  const trigger = base.triggers[0]!;
+  return createActiveProjectConfiguration(
+    createMemoryDatabase(),
+    {
+      ...base,
+      triggers: [
+        {
+          ...trigger,
+          filters: {
+            workspace: "T1",
+            from_users: ["U1"],
+            direct_messages: true,
+            ...filters,
+          },
+        },
+      ],
+    },
+    { organizationId: "org-1" },
+  );
+}
+
 function external(
   projectId: string,
   configurationRevisionId: string,
@@ -1113,9 +1240,35 @@ class RecordingSlackClient implements SlackBotClient {
       username?: string;
       failStatus?: boolean;
       displayName?: string;
+      joins?: Array<FoundJoin | Error>;
+      kinds?: Record<string, "im" | "mpim" | "channel">;
     } = {},
   ) {
     this.threadMessages = options.threadMessages ?? [];
+    this.joins = [...(options.joins ?? [])];
+  }
+
+  joinLookups: string[] = [];
+  leaves: string[] = [];
+  private readonly joins: Array<FoundJoin | Error>;
+
+  findChannelJoin(input: {
+    channelId: string;
+    userId: string;
+    oldest?: string;
+  }): Promise<FoundJoin> {
+    this.joinLookups.push(`${input.channelId}:${input.userId}:${input.oldest ?? "-"}`);
+    const next = this.joins.shift() ?? { join: undefined, newestTs: undefined };
+    return next instanceof Error ? Promise.reject(next) : Promise.resolve(next);
+  }
+
+  readConversationKind(input: { channelId: string }): Promise<"im" | "mpim" | "channel"> {
+    return Promise.resolve(this.options.kinds?.[input.channelId] ?? "channel");
+  }
+
+  leaveChannel(input: { channelId: string }): Promise<void> {
+    this.leaves.push(input.channelId);
+    return Promise.resolve();
   }
 
   sendMessage(input: (typeof this.messages)[number]): Promise<void> {

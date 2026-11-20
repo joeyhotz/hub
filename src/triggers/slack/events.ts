@@ -82,6 +82,20 @@ const SlackMessageSchema = z
   })
   .passthrough();
 
+/** A member joining a channel (message.channels / message.groups); `inviter` is absent if they joined alone. */
+const SlackChannelJoinSchema = z
+  .object({
+    type: z.literal("message"),
+    subtype: z.literal("channel_join"),
+    user: SlackIdSchema,
+    channel: SlackIdSchema,
+    channel_type: z.enum(["channel", "group"]).optional(),
+    text: z.string().default(""),
+    ts: SlackTimestampSchema,
+    inviter: SlackIdSchema.optional(),
+  })
+  .passthrough();
+
 export const NormalizedSlackMentionEventSchema = z.object({
   type: z.literal("mention"),
   id: SlackIdSchema,
@@ -99,6 +113,8 @@ export const NormalizedSlackMentionEventSchema = z.object({
   /** False for a message event: a direct message, or a reply in a thread without a mention. */
   mentioned: z.boolean().default(true),
   channelType: z.enum(["channel", "group", "im"]).nullable().default(null),
+  /** Set when the event is the author joining the channel; never addressed to the bot. */
+  join: z.object({ inviter: SlackIdSchema.nullable() }).optional(),
 });
 
 export type NormalizedSlackMentionEvent = z.infer<typeof NormalizedSlackMentionEventSchema>;
@@ -114,6 +130,12 @@ export function normalizeSlackEvent(
       return undefined;
     return normalized(envelope, mention.data, true, null);
   }
+  const join = SlackChannelJoinSchema.safeParse(envelope.event);
+  if (join.success)
+    return {
+      ...normalized(envelope, join.data, false, join.data.channel_type ?? null),
+      join: { inviter: join.data.inviter ?? null },
+    };
   const message = SlackMessageSchema.safeParse(envelope.event);
   if (!message.success || message.data.bot_id !== undefined) return undefined;
   const { channel_type: channelType, thread_ts: threadTs, ts } = message.data;

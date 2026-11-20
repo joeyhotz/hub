@@ -78,7 +78,30 @@ const SlackUserInfoSchema = SlackApiResponseSchema.extend({
     })
     .optional(),
 });
+const SlackHistorySchema = SlackApiResponseSchema.extend({
+  messages: z
+    .array(
+      z
+        .object({
+          ts: z.string().regex(/^\d+\.\d+$/u),
+          subtype: z.string().optional(),
+          user: z.string().optional(),
+          inviter: z.string().min(1).max(255).optional(),
+        })
+        .passthrough(),
+    )
+    .optional(),
+  response_metadata: z.object({ next_cursor: z.string().optional() }).optional(),
+});
+const SlackConversationInfoSchema = SlackApiResponseSchema.extend({
+  channel: z
+    .object({ is_im: z.boolean().optional(), is_mpim: z.boolean().optional() })
+    .passthrough()
+    .optional(),
+});
 const SLACK_API_TIMEOUT_MS = 10_000;
+/** 200 messages a page: a join older than 10,000 top-level messages is reported as unknown. */
+const SLACK_JOIN_HISTORY_MAX_PAGES = 50;
 const SLACK_THREAD_REPLIES_MAX_PAGES = 10;
 const SLACK_THREAD_CONTEXT_LIMIT = 50;
 const SLACK_REACTION_TARGET_GONE = ["message_not_found", "channel_not_found"] as const;
@@ -96,6 +119,12 @@ export interface SlackThreadMessage {
   content: string;
   author: { id: string };
   attachments: SlackAttachmentMetadata[];
+}
+
+/** The newest join of a member found in channel history, and the newest message read. */
+export interface SlackChannelJoinResult {
+  join: { inviter: string | null } | undefined;
+  newestTs: string | undefined;
 }
 
 export interface SlackThreadReadResult {
@@ -156,6 +185,27 @@ export interface SlackBotClient {
     teamId: string;
     fileId: string;
   }): Promise<Response>;
+  /**
+   * Who most recently added `userId` to the channel, from Slack's `channel_join` message.
+   * With `oldest`, reads only history after that message timestamp.
+   */
+  findChannelJoin?(input: {
+    organizationId: string;
+    teamId: string;
+    channelId: string;
+    userId: string;
+    oldest?: string;
+  }): Promise<SlackChannelJoinResult>;
+  readConversationKind?(input: {
+    organizationId: string;
+    teamId: string;
+    channelId: string;
+  }): Promise<"im" | "mpim" | "channel">;
+  leaveChannel?(input: {
+    organizationId: string;
+    teamId: string;
+    channelId: string;
+  }): Promise<void>;
 }
 
 /** Carries Slack's error code, which Hub logs; the message is never logged. */
@@ -317,6 +367,53 @@ export function createSlackBotClient(options: {
     });
   }
 
+  async function findChannelJoin(input: {
+    organizationId: string;
+    teamId: string;
+    channelId: string;
+    userId: string;
+    oldest?: string;
+  }): Promise<SlackChannelJoinResult> {
+    let cursor: string | undefined;
+    let newestTs: string | undefined;
+    for (let page = 0; page < SLACK_JOIN_HISTORY_MAX_PAGES; page += 1) {
+      const result = SlackHistorySchema.parse(
+        await queryJson(input.organizationId, input.teamId, "conversations.history", {
+          channel: input.channelId,
+          limit: "200",
+          ...(input.oldest === undefined ? {} : { oldest: input.oldest }),
+          ...(cursor === undefined ? {} : { cursor }),
+        }),
+      );
+      if (!result.ok) throw new SlackApiError(result.error);
+      // Slack returns history newest first, so the first join found is the latest.
+      const messages = result.messages ?? [];
+      newestTs ??= messages[0]?.ts;
+      const join = messages.find(
+        (message) => message.subtype === "channel_join" && message.user === input.userId,
+      );
+      if (join !== undefined) return { join: { inviter: join.inviter ?? null }, newestTs };
+      cursor = result.response_metadata?.next_cursor || undefined;
+      if (cursor === undefined) return { join: undefined, newestTs };
+    }
+    throw new Error("Slack channel history is too long to find the join");
+  }
+
+  async function readConversationKind(input: {
+    organizationId: string;
+    teamId: string;
+    channelId: string;
+  }): Promise<"im" | "mpim" | "channel"> {
+    const result = SlackConversationInfoSchema.parse(
+      await queryJson(input.organizationId, input.teamId, "conversations.info", {
+        channel: input.channelId,
+      }),
+    );
+    if (!result.ok) throw new SlackApiError(result.error);
+    if (result.channel?.is_im === true) return "im";
+    return result.channel?.is_mpim === true ? "mpim" : "channel";
+  }
+
   async function lookupUserName(input: {
     organizationId: string;
     teamId: string;
@@ -383,6 +480,12 @@ export function createSlackBotClient(options: {
     lookupUserName,
     lookupUserDisplayName,
     downloadAttachment,
+    findChannelJoin,
+    readConversationKind,
+    leaveChannel: (input) =>
+      call(input.organizationId, input.teamId, "conversations.leave", {
+        channel: input.channelId,
+      }),
   };
 }
 

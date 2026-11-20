@@ -113,6 +113,18 @@ describe("self-contained trigger documents", () => {
     assert.equal(slack?.filters?.follow_threads, true);
   });
 
+  it("carries the Slack channel_inviters and direct_message_users filters into the compiled trigger", () => {
+    const compiled = compileTriggerDocument(
+      trigger.replace(
+        "      channels: [engineering]\n",
+        "      channels: [engineering]\n      channel_inviters: [U1, U2]\n      direct_message_users: [U1]\n",
+      ),
+    );
+    const slack = compiled.events.find((event) => event.on === "slack.mention");
+    assert.deepEqual(slack?.filters?.channel_inviters, ["U1", "U2"]);
+    assert.deepEqual(slack?.filters?.direct_message_users, ["U1"]);
+  });
+
   it("rejects a non-boolean background value", () => {
     assert.throws(
       () => parseTriggerDocument(trigger.replace("run:", 'run:\n  background: "true"')),

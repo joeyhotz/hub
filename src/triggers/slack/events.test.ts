@@ -57,4 +57,18 @@ describe("Slack event normalization", () => {
     ])
       assert.equal(normalizeSlackEvent(envelope(dropped)), undefined, JSON.stringify(dropped));
   });
+
+  it("keeps a member joining a channel, with who added them, for the channel_inviters filter", () => {
+    const join = { type: "message", subtype: "channel_join", user: "UBOT", channel: "C1" };
+    const invited = normalizeSlackEvent(
+      envelope({ ...join, text: "<@UBOT> has joined", ts: "1700000000.000003", inviter: "U2" }),
+    );
+    assert.deepEqual(invited?.join, { inviter: "U2" });
+    assert.equal(invited?.author.id, "UBOT");
+    const selfJoined = normalizeSlackEvent(
+      envelope({ ...join, channel_type: "group", text: "", ts: "1700000000.000004" }),
+    );
+    assert.deepEqual(selfJoined?.join, { inviter: null });
+    assert.equal(normalizeSlackEvent(envelope(mention))?.join, undefined);
+  });
 });

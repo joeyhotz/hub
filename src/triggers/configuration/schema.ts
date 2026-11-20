@@ -49,6 +49,8 @@ export const TriggerFilterSchema = z
     from_users: z.array(z.string().min(1)).optional(),
     direct_messages: z.boolean().optional(),
     follow_threads: z.boolean().optional(),
+    channel_inviters: z.array(z.string().min(1)).optional(),
+    direct_message_users: z.array(z.string().min(1)).optional(),
     inputs: z.record(z.string(), InputValueSchema).optional(),
   })
   .strict();
